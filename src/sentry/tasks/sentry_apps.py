@@ -84,9 +84,11 @@ def _webhook_event_data(event, group_id, project_id):
     return event_context
 
 
-@instrumented_task(name="sentry.tasks.sentry_apps.send_alert_event", **TASK_OPTIONS)
+@instrumented_task(
+    name="sentry.tasks.sentry_apps.send_alert_event", bind=True, **TASK_OPTIONS
+)
 @retry(**RETRY_OPTIONS)
-def send_alert_event(event, rule, sentry_app_id):
+def send_alert_event(self, event, rule, sentry_app_id):
     """
     When an incident alert is triggered, send incident data to the SentryApp's webhook.
     :param event: The `Event` for which to build a payload.
@@ -129,7 +131,32 @@ def send_alert_event(event, rule, sentry_app_id):
         resource="event_alert", action="triggered", install=install, data=data
     )
 
-    send_and_save_webhook_request(sentry_app, request_data)
+    try:
+        send_and_save_webhook_request(sentry_app, request_data)
+    except ApiHostError as e:
+        # For 502 Bad Gateway errors, retry but don't create Sentry issues after all retries
+        if e.code == 502:
+            retry_count = self.request.retries
+            logger.warning(
+                "send_alert_event.bad_gateway_retry",
+                extra={
+                    **extra,
+                    "retry_count": retry_count,
+                    "max_retries": self.max_retries,
+                    "error_message": str(e),
+                },
+            )
+            # If we haven't exceeded max retries, retry the task
+            if retry_count < self.max_retries:
+                raise self.retry(exc=e)
+            # Otherwise, log final warning and suppress the error to prevent Sentry issue
+            logger.warning(
+                "send_alert_event.bad_gateway_final_failure",
+                extra={**extra, "error_message": str(e), "retry_count": retry_count},
+            )
+            return
+        # For other ApiHostError types, re-raise to maintain existing behavior
+        raise
 
 
 def _process_resource_change(action, sender, instance_id, retryer=None, *args, **kwargs):
@@ -190,10 +217,76 @@ def _process_resource_change(action, sender, instance_id, retryer=None, *args, *
         data = {}
         if isinstance(instance, Event):
             data[name] = _webhook_event_data(instance, instance.group_id, instance.project_id)
-            send_webhooks(installation, event, data=data)
+            try:
+                send_webhooks(installation, event, data=data)
+            except ApiHostError as e:
+                # For 502 Bad Gateway errors, retry but don't create Sentry issues after all retries
+                if e.code == 502:
+                    # Check if we're in a task context with retries available
+                    if hasattr(retryer, 'request'):
+                        retry_count = retryer.request.retries
+                        max_retries = getattr(retryer, 'max_retries', 3)
+                        logger.warning(
+                            "process_resource_change.bad_gateway_retry",
+                            extra={
+                                "event": event,
+                                "installation_id": installation.id,
+                                "retry_count": retry_count,
+                                "max_retries": max_retries,
+                                "error_message": str(e),
+                            },
+                        )
+                        if retry_count < max_retries:
+                            return retryer.retry(exc=e)
+                        # Log final warning and suppress to prevent Sentry issue
+                        logger.warning(
+                            "process_resource_change.bad_gateway_final_failure",
+                            extra={
+                                "event": event,
+                                "installation_id": installation.id,
+                                "error_message": str(e),
+                                "retry_count": retry_count,
+                            },
+                        )
+                        continue  # Skip this installation but continue with others
+                # For other ApiHostError types or non-task context, re-raise
+                raise
         else:
             data[name] = serialize(instance)
-            send_webhooks(installation, event, data=data)
+            try:
+                send_webhooks(installation, event, data=data)
+            except ApiHostError as e:
+                # For 502 Bad Gateway errors, retry but don't create Sentry issues after all retries
+                if e.code == 502:
+                    # Check if we're in a task context with retries available
+                    if hasattr(retryer, 'request'):
+                        retry_count = retryer.request.retries
+                        max_retries = getattr(retryer, 'max_retries', 3)
+                        logger.warning(
+                            "process_resource_change.bad_gateway_retry",
+                            extra={
+                                "event": event,
+                                "installation_id": installation.id,
+                                "retry_count": retry_count,
+                                "max_retries": max_retries,
+                                "error_message": str(e),
+                            },
+                        )
+                        if retry_count < max_retries:
+                            return retryer.retry(exc=e)
+                        # Log final warning and suppress to prevent Sentry issue
+                        logger.warning(
+                            "process_resource_change.bad_gateway_final_failure",
+                            extra={
+                                "event": event,
+                                "installation_id": installation.id,
+                                "error_message": str(e),
+                                "retry_count": retry_count,
+                            },
+                        )
+                        continue  # Skip this installation but continue with others
+                # For other ApiHostError types or non-task context, re-raise
+                raise
 
         metrics.incr("resource_change.processed", sample_rate=1.0, tags={"change_event": event})
 
@@ -232,9 +325,11 @@ def installation_webhook(installation_id, user_id, *args, **kwargs):
     InstallationNotifier.run(install=install, user=user, action="created")
 
 
-@instrumented_task(name="sentry.tasks.sentry_apps.workflow_notification", **TASK_OPTIONS)
+@instrumented_task(
+    name="sentry.tasks.sentry_apps.workflow_notification", bind=True, **TASK_OPTIONS
+)
 @retry(**RETRY_OPTIONS)
-def workflow_notification(installation_id, issue_id, type, user_id, *args, **kwargs):
+def workflow_notification(self, installation_id, issue_id, type, user_id, *args, **kwargs):
     extra = {"installation_id": installation_id, "issue_id": issue_id}
 
     try:
@@ -261,7 +356,32 @@ def workflow_notification(installation_id, issue_id, type, user_id, *args, **kwa
     data = kwargs.get("data", {})
     data.update({"issue": serialize(issue)})
 
-    send_webhooks(installation=install, event=u"issue.{}".format(type), data=data, actor=user)
+    try:
+        send_webhooks(installation=install, event=u"issue.{}".format(type), data=data, actor=user)
+    except ApiHostError as e:
+        # For 502 Bad Gateway errors, retry but don't create Sentry issues after all retries
+        if e.code == 502:
+            retry_count = self.request.retries
+            logger.warning(
+                "workflow_notification.bad_gateway_retry",
+                extra={
+                    **extra,
+                    "retry_count": retry_count,
+                    "max_retries": self.max_retries,
+                    "error_message": str(e),
+                },
+            )
+            # If we haven't exceeded max retries, retry the task
+            if retry_count < self.max_retries:
+                raise self.retry(exc=e)
+            # Otherwise, log final warning and suppress the error to prevent Sentry issue
+            logger.warning(
+                "workflow_notification.bad_gateway_final_failure",
+                extra={**extra, "error_message": str(e), "retry_count": retry_count},
+            )
+            return
+        # For other ApiHostError types, re-raise to maintain existing behavior
+        raise
 
 
 def notify_sentry_app(event, futures):
@@ -380,7 +500,19 @@ def send_and_save_webhook_request(sentry_app, app_platform_event, url=None):
             project_id=resp.headers.get("Sentry-Hook-Project"),
         )
 
-        if resp.status_code == 503:
+        if resp.status_code == 502:
+            logger.warning(
+                "send_and_save_webhook_request.bad_gateway",
+                extra={
+                    "organization_id": org_id,
+                    "integration_slug": sentry_app.slug,
+                    "url": url,
+                    "status_code": resp.status_code,
+                },
+            )
+            raise ApiHostError.from_request(resp.request)
+
+        elif resp.status_code == 503:
             raise ApiHostError.from_request(resp.request)
 
         elif resp.status_code == 504:

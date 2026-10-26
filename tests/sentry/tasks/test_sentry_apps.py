@@ -477,3 +477,26 @@ class TestWebhookRequests(TestCase):
         assert first_request["organization_id"] == self.install.organization.id
         assert first_request["error_id"] == "d5111da2c28645c5889d072017e3445d"
         assert first_request["project_id"] == "1"
+
+    @patch("sentry.tasks.sentry_apps.safe_urlopen")
+    def test_retries_on_bad_gateway_502(self, safe_urlopen):
+        from sentry.shared_integrations.exceptions import ApiHostError
+
+        # Create a 502 response
+        mock_502_response = MockResponse({}, {}, False, 502, raiseStatusTrue)
+        safe_urlopen.return_value = mock_502_response
+
+        data = {"issue": serialize(self.issue)}
+        self.sentry_app.update(status=SentryAppStatus.PUBLISHED)
+
+        # Should raise ApiHostError which triggers retries
+        with self.assertRaises(ApiHostError):
+            send_webhooks(
+                installation=self.install, event="issue.assigned", data=data, actor=self.user
+            )
+
+        # Verify the request was logged
+        requests = self.buffer.get_requests()
+        assert len(requests) == 1
+        assert requests[0]["response_code"] == 502
+        assert requests[0]["event_type"] == "issue.assigned"
